@@ -28,9 +28,11 @@ limitations under the License.
 #include "tensorflow/c/eager/c_api_experimental.h"
 #include "tensorflow/c/eager/c_api_internal.h"
 #include "tensorflow/c/eager/dlpack.h"
+#include "tensorflow/c/eager/tfe_tensorhandle_internal.h"
 #include "tensorflow/c/tf_status.h"
 #include "tensorflow/c/tf_status_helper.h"
 #include "tensorflow/compiler/jit/flags.h"
+#include "tensorflow/compiler/jit/get_compiler_ir.h"
 #include "tensorflow/python/eager/pywrap_tensor_conversion.h"
 #include "tensorflow/python/eager/pywrap_tfe.h"
 #include "tensorflow/python/lib/core/py_exception_registry.h"
@@ -202,6 +204,13 @@ TFE_OutputTensorHandles InputTFE_OutputTensorHandles(
 #else
   long sz = PyLong_AsLong(num_outputs.ptr());  // NOLINT
 #endif
+  // We can't handle more than int32 sizes for number of outputs.
+  if (static_cast<long>(static_cast<int32>(sz)) != sz) {  // NOLINT
+    PyErr_SetString(PyExc_ValueError, tensorflow::strings::StrCat(
+                                          "Number of outputs is too big: ", sz)
+                                          .c_str());
+    throw py::error_already_set();
+  }
   if (sz > 0) {
 #if PY_MAJOR_VERSION < 3
     output_tensor_handles.resize(PyInt_AsLong(num_outputs.ptr()), nullptr);
@@ -285,6 +294,67 @@ static py::object TFE_ClearScalarCache() {
   return py::none();
 }
 
+// Returns compiler IR for a given function.
+static std::string TFE_GetCompilerIr(py::handle& ctx,
+                                     const char* concrete_function_name,
+                                     const char* stage, const char* device_name,
+                                     py::handle& inputs) {
+  EagerContext* context = ContextFromInterface(
+      reinterpret_cast<ImmediateExecutionContext*>(InputTFE_Context(ctx)));
+
+  std::string s_stage(stage);
+  IrExportStage selected_stage = [&] {
+    if (s_stage == "hlo") {
+      return IrExportStage::HLO;
+    } else if (s_stage == "optimized_hlo") {
+      return IrExportStage::OPTIMIZED_HLO;
+    } else if (s_stage == "optimized_hlo_dot") {
+      return IrExportStage::OPTIMIZED_HLO_DOT;
+    } else {
+      ThrowValueError(
+          absl::StrFormat("Invalid stage selected: '%s'. Valid values are: "
+                          "'hlo', 'optimized_hlo', 'optimized_hlo_dot'",
+                          s_stage)
+              .c_str());
+    }
+  }();
+
+  TFE_InputTensorHandles handles = InputTFE_InputTensorHandles(inputs);
+
+  std::vector<const TensorHandle*> input_handles;
+  for (TFE_TensorHandle* tensor_handle : handles) {
+    AbstractTensorHandle* abstract_tensor_handle = unwrap(tensor_handle);
+    input_handles.push_back(TensorHandleFromInterface(abstract_tensor_handle));
+  }
+
+  DeviceNameUtils::ParsedName input_device_name;
+  if (!DeviceNameUtils::ParseFullOrLocalName(device_name, &input_device_name)) {
+    ThrowValueError(
+        absl::StrFormat("Failed parsing device name: '%s'", device_name)
+            .c_str());
+  }
+
+  std::vector<Device*> devices = context->local_device_mgr()->ListDevices();
+  auto selected_device = absl::c_find_if(devices, [&](const Device* d) {
+    return DeviceNameUtils::AreCompatibleDevNames(input_device_name,
+                                                  d->parsed_name());
+  });
+  if (selected_device == devices.end()) {
+    ThrowValueError("No matching device found");
+  }
+
+  xla::StatusOr<std::string> hlo_text =
+      GetCompilerIr(selected_stage, context->pflr(), concrete_function_name,
+                    *selected_device, context, input_handles);
+
+  if (!hlo_text.ok()) {
+    ThrowValueError(absl::StrFormat("Failed getting HLO text: '%s'",
+                                    hlo_text.status().error_message())
+                        .c_str());
+  }
+  return *hlo_text;
+}
+
 }  // namespace tensorflow
 
 namespace {
@@ -297,11 +367,11 @@ namespace {
 class EagerContextThreadLocalDataWrapper {
  public:
   explicit EagerContextThreadLocalDataWrapper(py::handle py_eager_context,
-                                              bool is_eager,
+                                              py::handle is_eager,
                                               py::handle device_spec)
       : py_eager_context_(py_eager_context.ptr()) {
-    tensorflow::MakeEagerContextThreadLocalData(py_eager_context.ptr(),
-                                                is_eager, device_spec.ptr());
+    tensorflow::MakeEagerContextThreadLocalData(
+        py_eager_context.ptr(), is_eager.ptr(), device_spec.ptr());
   }
 
   ~EagerContextThreadLocalDataWrapper() {
@@ -356,7 +426,12 @@ class EagerContextThreadLocalDataWrapper {
 
  private:
   tensorflow::EagerContextThreadLocalData* GetData() const {
-    return tensorflow::GetEagerContextThreadLocalData(py_eager_context_);
+    auto* result =
+        tensorflow::GetEagerContextThreadLocalData(py_eager_context_);
+    if (!result) {
+      throw py::error_already_set();
+    }
+    return result;
   }
 
   py::handle GetPyObject(tensorflow::Safe_PyObjectPtr* obj) const {
@@ -508,13 +583,21 @@ PYBIND11_MODULE(_pywrap_tfe, m) {
   m.def("TF_SetXlaConstantFoldingDisabled", &TF_SetXlaConstantFoldingDisabled);
   m.def("TF_GetXlaConstantFoldingDisabled", &TF_GetXlaConstantFoldingDisabled);
   m.def("TF_SetXlaMinClusterSize", &TF_SetXlaMinClusterSize);
+  m.def("TF_GetCompilerIr", &tensorflow::TFE_GetCompilerIr);
 
   // MLIR Logic
   m.def("TF_IsMlirBridgeEnabled", [] {
-    return tensorflow::GetMlirCommonFlags()->tf_mlir_enable_mlir_bridge;
+    // Since python protobuf enums are integers, cast to an integer before
+    // returning the enum to python.
+    return static_cast<int32_t>(
+        tensorflow::GetMlirCommonFlags()->tf_mlir_enable_mlir_bridge);
   });
   m.def("TF_EnableMlirBridge", [](bool enabled) {
-    tensorflow::GetMlirCommonFlags()->tf_mlir_enable_mlir_bridge = enabled;
+    tensorflow::GetMlirCommonFlags()->tf_mlir_enable_mlir_bridge =
+        enabled
+            ? tensorflow::ConfigProto::Experimental::MLIR_BRIDGE_ROLLOUT_ENABLED
+            : tensorflow::ConfigProto::Experimental::
+                  MLIR_BRIDGE_ROLLOUT_DISABLED;
   });
   m.def("TF_EnableXlaDevices", [] {
     tensorflow::GetXlaDeviceFlags()->tf_xla_enable_xla_devices = true;
@@ -923,8 +1006,6 @@ PYBIND11_MODULE(_pywrap_tfe, m) {
   });
   m.def("TFE_ContextOptionsSetDevicePlacementPolicy",
         &TFE_ContextOptionsSetDevicePlacementPolicy);
-  m.def("TFE_ContextOptionsSetLazyRemoteInputsCopy",
-        &TFE_ContextOptionsSetLazyRemoteInputsCopy);
   m.def("TFE_ContextOptionsSetTfrt", &TFE_ContextOptionsSetTfrt);
   m.def("TFE_ContextOptionsSetAsync", &TFE_ContextOptionsSetAsync);
   m.def("TFE_DeleteContextOptions", &TFE_DeleteContextOptions,
@@ -946,12 +1027,6 @@ PYBIND11_MODULE(_pywrap_tfe, m) {
   // Additional Context Logic
   m.def("TFE_Py_SetEagerContext", [](const py::handle& o) {
     return tensorflow::PyoOrThrow(TFE_Py_SetEagerContext(o.ptr()));
-  });
-  m.def("TFE_ContextStartStep", [](py::handle& o) {
-    TFE_ContextStartStep(tensorflow::InputTFE_Context(o.ptr()));
-  });
-  m.def("TFE_ContextEndStep", [](py::handle& o) {
-    TFE_ContextEndStep(tensorflow::InputTFE_Context(o.ptr()));
   });
   m.def("TFE_Py_RegisterVSpace", [](const py::handle& o) {
     return tensorflow::PyoOrThrow(TFE_Py_RegisterVSpace(o.ptr()));
@@ -978,11 +1053,11 @@ PYBIND11_MODULE(_pywrap_tfe, m) {
     TFE_AbortCollectiveOps(tensorflow::InputTFE_Context(ctx), status.get());
   });
   m.def("TFE_CollectiveOpsCheckPeerHealth",
-        [](const py::handle& ctx, const char* task) {
+        [](const py::handle& ctx, const char* task, int64_t timeout_in_ms) {
           tensorflow::Safe_TF_StatusPtr status =
               tensorflow::make_safe(TF_NewStatus());
           TFE_CollectiveOpsCheckPeerHealth(tensorflow::InputTFE_Context(ctx),
-                                           task, status.get());
+                                           task, timeout_in_ms, status.get());
           tensorflow::MaybeRaiseRegisteredFromTFStatus(status.get());
         });
   m.def("TF_ListPhysicalDevices", &tensorflow::TF_ListPhysicalDevices);
@@ -1282,9 +1357,16 @@ PYBIND11_MODULE(_pywrap_tfe, m) {
   // DLPack functions
   m.def("TFE_ToDlpackCapsule", [](py::handle& o) {
     PyObject* eager_tensor_pyobject_ptr = o.ptr();
-    TFE_TensorHandle* thandle = EagerTensor_Handle(eager_tensor_pyobject_ptr);
     tensorflow::Safe_TF_StatusPtr status =
         tensorflow::make_safe(TF_NewStatus());
+
+    if (!EagerTensor_CheckExact(eager_tensor_pyobject_ptr)) {
+      status->status = tensorflow::errors::InvalidArgument(
+          "The argument to `to_dlpack` must be a TF tensor, not Python object");
+      tensorflow::MaybeRaiseRegisteredFromTFStatus(status.get());
+    }
+
+    TFE_TensorHandle* thandle = EagerTensor_Handle(eager_tensor_pyobject_ptr);
     void* dlm_ptr = tensorflow::TFE_HandleToDLPack(thandle, status.get());
     tensorflow::MaybeRaiseRegisteredFromTFStatus(status.get());
 
@@ -1362,7 +1444,7 @@ PYBIND11_MODULE(_pywrap_tfe, m) {
 
   py::class_<EagerContextThreadLocalDataWrapper>(m,
                                                  "EagerContextThreadLocalData")
-      .def(py::init<py::handle, bool, py::handle>(),
+      .def(py::init<py::handle, py::handle, py::handle>(),
            py::arg("py_eager_context"), py::arg("is_eager"),
            py::arg("device_spec"))
       .def_property("is_eager",
